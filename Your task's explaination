@@ -1,0 +1,324 @@
+# ============================================================================
+# IMPORT SECTION - Bringing in tools we need
+# ============================================================================
+
+from pyspark import SparkContext, SparkConf
+# SparkContext: The main connection to Spark (lets us use Spark features)
+# SparkConf: Configuration settings for Spark
+
+import os
+# os: Helps us work with files and folders on the computer
+
+import re
+# re: Regular expressions - helps us find patterns in text (like finding words)
+
+
+# ============================================================================
+# SPARK INITIALIZATION - Starting Spark
+# ============================================================================
+
+import os
+# Set Java options to fix compatibility with Java 17+
+os.environ['PYSPARK_SUBMIT_ARGS'] = '--conf spark.driver.extraJavaOptions="-Djava.security.manager=allow" --conf spark.executor.extraJavaOptions="-Djava.security.manager=allow" pyspark-shell'
+
+conf = SparkConf().setAppName("PositionalIndex").setMaster("local[*]")
+# SparkConf(): Create configuration object
+# setAppName("PositionalIndex"): Give our app a name (you'll see this in Spark UI)
+# setMaster("local[*]"): Run Spark locally on your computer, use all CPU cores
+
+sc = SparkContext(conf=conf)
+# sc: Create the Spark Context using our configuration
+# This is THE main object we use to work with Spark
+
+
+# ============================================================================
+# MAIN FUNCTION - Does all the work
+# ============================================================================
+
+def build_positional_index(input_folder, output_file):
+    """
+    Build a positional index from text documents.
+    
+    Args:
+        input_folder: Path to folder containing .txt files (e.g., "./dataset")
+        output_file: Path to output file for positional index (e.g., "./positional_index.txt")
+    """
+    
+    # ========================================================================
+    # STEP 1: Read all text files from the folder
+    # ========================================================================
+    
+    # Get list of all .txt files in the input folder
+    files = [f for f in os.listdir(input_folder) if f.endswith('.txt')]
+    # os.listdir(input_folder): Lists all files in the folder
+    # if f.endswith('.txt'): Only keep files that end with .txt
+    # Result: files = ['1.txt', '2.txt', '3.txt', ..., '10.txt']
+    
+    # Read each file and create (filename, content) pairs
+    documents = sc.parallelize([
+        (filename, open(os.path.join(input_folder, filename), 'r').read())
+        for filename in files
+    ])
+    # sc.parallelize(): Converts Python list to Spark RDD (Resilient Distributed Dataset)
+    # RDD is Spark's way of storing distributed data
+    # os.path.join(input_folder, filename): Combines folder + filename (e.g., "dataset/1.txt")
+    # open(..., 'r').read(): Opens file and reads all content as string
+    # Result: RDD of [('1.txt', 'antony brutus caeser...'), ('2.txt', 'antony brutus...'), ...]
+    
+    
+    # ========================================================================
+    # STEP 2: Extract (term, document, position) from each document
+    # ========================================================================
+    
+    def extract_terms_with_positions(doc_tuple):
+        """
+        Takes one document and extracts all terms with their positions.
+        
+        Input: ('1.txt', 'antony brutus caeser cleopatra mercy worser')
+        Output: [('antony', '1.txt', 0), ('brutus', '1.txt', 1), ('caeser', '1.txt', 2), ...]
+        """
+        doc_name, content = doc_tuple
+        # Unpack the tuple: doc_name = '1.txt', content = 'antony brutus...'
+        
+        # Convert to lowercase and split into words
+        words = re.findall(r'\b\w+\b', content.lower())
+        # content.lower(): Convert all text to lowercase (so "Mercy" and "mercy" are same)
+        # re.findall(r'\b\w+\b', ...): Find all words (letters, numbers, underscore)
+        # \b: word boundary, \w+: one or more word characters
+        # Result: words = ['antony', 'brutus', 'caeser', 'cleopatra', 'mercy', 'worser']
+        
+        # Create (term, doc_name, position) for each word
+        result = []
+        for position, term in enumerate(words):
+            # enumerate(words): Gives us both index and value
+            # position = 0, 1, 2, 3... (the position in document)
+            # term = 'antony', 'brutus', 'caeser'...
+            result.append((term, doc_name, position))
+            # Append tuple (term, document, position) to result list
+        
+        return result
+        # Returns: [('antony', '1.txt', 0), ('brutus', '1.txt', 1), ...]
+    
+    # Apply extraction to ALL documents
+    term_doc_pos = documents.flatMap(extract_terms_with_positions)
+    # flatMap: Apply function to each element AND flatten the results
+    # Input: [('1.txt', 'antony brutus...'), ('2.txt', 'antony brutus...')]
+    # Output: [('antony', '1.txt', 0), ('brutus', '1.txt', 1), ('caeser', '1.txt', 2),
+    #          ('antony', '2.txt', 0), ('brutus', '2.txt', 1), ...]
+    # All tuples from all documents are now in ONE flat list
+    
+    
+    # ========================================================================
+    # STEP 3: Transform to ((term, doc), position) for grouping
+    # ========================================================================
+    
+    term_doc_with_pos = term_doc_pos.map(lambda x: ((x[0], x[1]), x[2]))
+    # map: Transform each element
+    # lambda x: anonymous function where x is each tuple
+    # x[0] = term, x[1] = document, x[2] = position
+    # ((x[0], x[1]), x[2]): Creates ((term, document), position)
+    # Example: ('antony', '1.txt', 0) becomes (('antony', '1.txt'), 0)
+    # Why? Because we want to group by (term, document) pair
+    
+    
+    # ========================================================================
+    # STEP 4: Group positions by (term, document)
+    # ========================================================================
+    
+    grouped_by_term_doc = term_doc_with_pos.groupByKey().mapValues(list)
+    # groupByKey(): Groups all values with the same key together
+    # Key is (term, document), values are positions
+    # Example: (('mercy', '1.txt'), 4) and (('mercy', '1.txt'), 4) would group together
+    # (but in this dataset each term appears once per position per doc)
+    # mapValues(list): Converts the grouped values to a Python list
+    # Result: [(('mercy', '1.txt'), [4]), (('mercy', '3.txt'), [0]), ...]
+    
+    
+    # ========================================================================
+    # STEP 5: Transform to (term, (doc, [positions]))
+    # ========================================================================
+    
+    term_with_doc_positions = grouped_by_term_doc.map(
+        lambda x: (x[0][0], (x[0][1], sorted(x[1])))
+    )
+    # x[0] is the key: ('mercy', '1.txt')
+    # x[0][0] is the term: 'mercy'
+    # x[0][1] is the document: '1.txt'
+    # x[1] is the list of positions: [4]
+    # sorted(x[1]): Sort positions in ascending order
+    # Result: ('mercy', ('1.txt', [4]))
+    # Now the structure is: (term, (document, [list of positions]))
+    
+    
+    # ========================================================================
+    # STEP 6: Group all documents by term
+    # ========================================================================
+    
+    positional_index = term_with_doc_positions.groupByKey().mapValues(list)
+    # groupByKey(): Now group by term only (not by term+document)
+    # All documents for the same term get grouped together
+    # Example: All entries for 'mercy' from different documents combine
+    # Result: [('mercy', [('1.txt', [4]), ('3.txt', [0]), ('4.txt', [2]), ...]), ...]
+    # Now we have: (term, [(doc1, [positions]), (doc2, [positions]), ...])
+    
+    
+    # ========================================================================
+    # STEP 7: Format the output as required
+    # ========================================================================
+    
+    def format_output(term_docs):
+        """
+        Format: term doc1: pos1, pos2, ...; doc2: pos1, pos2, ...; etc.
+        
+        Input: ('mercy', [('1.txt', [4]), ('3.txt', [0]), ('4.txt', [2])])
+        Output: "mercy 1.txt: 4; 3.txt: 0; 4.txt: 2"
+        """
+        term, doc_list = term_docs
+        # Unpack: term = 'mercy', doc_list = [('1.txt', [4]), ('3.txt', [0]), ...]
+        
+        # Sort documents for consistent output
+        doc_list_sorted = sorted(doc_list, key=lambda x: x[0])
+        # Sort by document name (x[0]) alphabetically
+        # So documents appear in order: 1.txt, 10.txt, 2.txt, 3.txt...
+        
+        # Build the formatted string
+        doc_strings = []
+        for doc_name, positions in doc_list_sorted:
+            # For each document and its positions
+            pos_str = ', '.join(map(str, positions))
+            # map(str, positions): Convert each position number to string
+            # ', '.join(...): Join them with commas (e.g., "0, 4, 7")
+            doc_strings.append(f"{doc_name}: {pos_str}")
+            # Append "1.txt: 4" to the list
+        
+        return f"{term} {'; '.join(doc_strings)}"
+        # '; '.join(doc_strings): Join all document strings with semicolons
+        # Return final format: "mercy 1.txt: 4; 3.txt: 0; 4.txt: 2"
+    
+    formatted_index = positional_index.map(format_output)
+    # Apply format_output to each term's data
+    # Result: RDD of formatted strings like "mercy 1.txt: 4; 3.txt: 0; ..."
+    
+    
+    # ========================================================================
+    # STEP 8: Sort by term and save to file
+    # ========================================================================
+    
+    sorted_index = formatted_index.sortBy(lambda x: x.split()[0])
+    # sortBy: Sort the RDD
+    # x.split()[0]: Split the string by spaces and take first word (the term)
+    # This sorts alphabetically by term name
+    # Result: Sorted list of formatted strings
+    
+    # Collect results from Spark to local Python
+    results = sorted_index.collect()
+    # collect(): Brings all data from Spark RDD back to regular Python list
+    # Now results is a normal Python list we can work with
+    
+    # Write to output file
+    with open(output_file, 'w') as f:
+        # open(output_file, 'w'): Create/open file for writing
+        # 'w' means write mode (creates file if doesn't exist)
+        # 'as f': Give it a short name 'f' to use in this block
+        for line in results:
+            f.write(line + '\n')
+            # Write each formatted line to the file
+            # '\n' adds a newline after each line
+    
+    # Print success message
+    print(f"Positional index created successfully!")
+    print(f"Total unique terms: {len(results)}")
+    print(f"Output saved to: {output_file}")
+    
+    # Display first 10 entries as sample
+    print("\n=== Sample Output (first 10 terms) ===")
+    for i, line in enumerate(results[:10]):
+        # enumerate: Gives us index and value
+        # results[:10]: First 10 items from results list
+        print(line)
+    
+    return results
+    # Return the results in case we want to use them later
+
+
+# ============================================================================
+# MAIN EXECUTION - The actual program starts here
+# ============================================================================
+
+if __name__ == "__main__":
+    # This block only runs if you run this file directly (not if imported)
+    
+    # Set your paths here
+    INPUT_FOLDER = "./dataset"  # Folder containing 1.txt, 2.txt, ..., 10.txt
+    OUTPUT_FILE = "./positional_index.txt"  # Where to save the output
+    
+    # Call the function to build the positional index
+    positional_index = build_positional_index(INPUT_FOLDER, OUTPUT_FILE)
+    
+    # Stop Spark context (clean up resources)
+    sc.stop()
+    # Always stop Spark when done to free up memory and resources
+    
+    print("\n✓ Done! Use 'positional_index.txt' for Part 2 of your project.")
+
+
+
+
+
+
+
+
+STEP 1: Read Files
+─────────────────
+[('1.txt', 'antony brutus caeser...'), ('2.txt', 'antony brutus...')]
+
+↓ flatMap (extract_terms_with_positions)
+
+STEP 2: Extract terms with positions
+────────────────────────────────────
+[('antony', '1.txt', 0), ('brutus', '1.txt', 1), ('caeser', '1.txt', 2),
+ ('antony', '2.txt', 0), ('brutus', '2.txt', 1), ...]
+
+↓ map (restructure)
+
+STEP 3: Transform to ((term, doc), position)
+────────────────────────────────────────────
+[(('antony', '1.txt'), 0), (('brutus', '1.txt'), 1), 
+ (('caeser', '1.txt'), 2), (('antony', '2.txt'), 0), ...]
+
+↓ groupByKey + mapValues(list)
+
+STEP 4: Group positions by (term, document)
+───────────────────────────────────────────
+[(('antony', '1.txt'), [0]), (('brutus', '1.txt'), [1]),
+ (('antony', '2.txt'), [0]), ...]
+
+↓ map (restructure again)
+
+STEP 5: Transform to (term, (doc, [positions]))
+───────────────────────────────────────────────
+[('antony', ('1.txt', [0])), ('brutus', ('1.txt', [1])),
+ ('antony', ('2.txt', [0])), ...]
+
+↓ groupByKey + mapValues(list)
+
+STEP 6: Group all documents by term
+───────────────────────────────────
+[('antony', [('1.txt', [0]), ('2.txt', [0]), ('6.txt', [0])]),
+ ('brutus', [('1.txt', [1]), ('2.txt', [1]), ('4.txt', [0])]), ...]
+
+↓ map (format_output)
+
+STEP 7: Format as required
+──────────────────────────
+['antony 1.txt: 0; 2.txt: 0; 6.txt: 0',
+ 'brutus 1.txt: 1; 2.txt: 1; 4.txt: 0', ...]
+
+↓ sortBy + collect + write to file
+
+STEP 8: Final Output File
+─────────────────────────
+angels 7.txt: 0; 8.txt: 0; 9.txt: 0
+antony 1.txt: 0; 2.txt: 0; 6.txt: 0
+brutus 1.txt: 1; 2.txt: 1; 4.txt: 0
+...
